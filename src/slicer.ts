@@ -1,6 +1,7 @@
 import ts, { isDeclarationStatement } from 'typescript';
 import path from 'path';
 import fs from 'fs';
+import { Command } from 'commander';
 
 /**
  * El "cerebro" de la herramienta.
@@ -164,6 +165,12 @@ class Slicer {
     const symbol = this.checker.getSymbolAtLocation(identifier);
     if (!symbol) return;
 
+    // Filtrar parámetros de tipo genérico (TypeParameter)
+    // Estos son símbolos locales a la declaración, no dependencias externas
+    if (symbol.getFlags() & ts.SymbolFlags.TypeParameter) {
+      return;
+    }
+
     // Sigue los alias (como imports) hasta el símbolo original
     let aliasedSymbol = symbol;
     if (symbol.getFlags() & ts.SymbolFlags.Alias) {
@@ -198,10 +205,26 @@ class Slicer {
       // 4. Para ciertos tipos de declaraciones, usar el contenedor completo
       let nodeToProcess: ts.Node = declaration;
 
-      // Si es una PropertySignature, queremos toda la interface/type
+      // Si es una PropertySignature (interface/type), queremos toda la interface/type
       if (ts.isPropertySignature(declaration)) {
         const parent = declaration.parent;
         if (parent && (ts.isInterfaceDeclaration(parent) || ts.isTypeAliasDeclaration(parent))) {
+          nodeToProcess = parent;
+        }
+      }
+
+      // Si es una PropertyDeclaration (class), queremos toda la clase
+      if (ts.isPropertyDeclaration(declaration)) {
+        const parent = declaration.parent;
+        if (parent && ts.isClassDeclaration(parent)) {
+          nodeToProcess = parent;
+        }
+      }
+
+      // Si es un MethodDeclaration (método de clase), queremos toda la clase
+      if (ts.isMethodDeclaration(declaration)) {
+        const parent = declaration.parent;
+        if (parent && ts.isClassDeclaration(parent)) {
           nodeToProcess = parent;
         }
       }
@@ -249,6 +272,46 @@ class Slicer {
     const visitor = (node: ts.Node) => {
       // Evitar procesar el nombre de la propia declaración
       if (ts.isIdentifier(node) && node !== symbolNode) {
+        // Filtrar identificadores que son parte de la declaración misma, no referencias externas
+        const parent = node.parent;
+
+        // 1. Evitar nombres de parámetros de tipo genérico (TypeParameter)
+        if (parent && ts.isTypeParameterDeclaration(parent) && parent.name === node) {
+          ts.forEachChild(node, visitor);
+          return;
+        }
+
+        // 2. Evitar nombres de propiedades de clase/interface
+        if (parent && (ts.isPropertyDeclaration(parent) || ts.isPropertySignature(parent)) && parent.name === node) {
+          ts.forEachChild(node, visitor);
+          return;
+        }
+
+        // 3. Evitar nombres de métodos
+        if (parent && (ts.isMethodDeclaration(parent) || ts.isMethodSignature(parent)) && parent.name === node) {
+          ts.forEachChild(node, visitor);
+          return;
+        }
+
+        // 4. Evitar nombres de parámetros de función/método/constructor
+        if (parent && ts.isParameter(parent) && parent.name === node) {
+          ts.forEachChild(node, visitor);
+          return;
+        }
+
+        // 5. Evitar nombres de variables locales (BindingElement en destructuring)
+        if (parent && ts.isBindingElement(parent) && parent.name === node) {
+          ts.forEachChild(node, visitor);
+          return;
+        }
+
+        // 6. Evitar nombres en VariableDeclaration
+        if (parent && ts.isVariableDeclaration(parent) && parent.name === node) {
+          ts.forEachChild(node, visitor);
+          return;
+        }
+
+        // Este es un identificador que referencia algo externo
         this.handleIdentifier(node, declaration);
       }
       ts.forEachChild(node, visitor);
@@ -298,42 +361,110 @@ class Slicer {
 
 // --- Ejecución del CLI ---
 
-function printHelp() {
-    console.log("Uso: ts-node slicer.ts <projectRoot> <entryFile> <symbolName>");
-    console.log("\nArgumentos:");
-    console.log("  <projectRoot>  Ruta al directorio que contiene el tsconfig.json del proyecto.");
-    console.log("  <entryFile>    Ruta al archivo que contiene el símbolo de inicio.");
-    console.log("  <symbolName>   Nombre del símbolo (función, clase, etc.) a extraer.");
-    console.log("\nEjemplo (usando el script 'start' de package.json):");
-    console.log("  npm start");
-}
+/**
+ * Escribe el resultado del slicing a archivos en el directorio de salida,
+ * respetando la estructura de directorios del proyecto original.
+ */
+function writeToOutputDirectory(
+  result: Map<string, ts.Declaration[]>,
+  outputDir: string,
+  projectRoot: string
+) {
+  const absoluteProjectRoot = path.resolve(projectRoot);
+  const absoluteOutputDir = path.resolve(outputDir);
 
+  console.log(`\n📁 Escribiendo archivos a: ${outputDir}\n`);
 
-function main() {
-  const args = process.argv.slice(2);
-  if (args.length !== 3) {
-    printHelp();
-    process.exit(1);
+  for (const [fileName, nodes] of result.entries()) {
+    // Calcular la ruta relativa desde el proyecto raíz
+    const relativeFromRoot = path.relative(absoluteProjectRoot, fileName);
+
+    // Construir la ruta de salida manteniendo la estructura
+    const outputFilePath = path.join(absoluteOutputDir, relativeFromRoot);
+
+    // Crear los directorios necesarios
+    const outputFileDir = path.dirname(outputFilePath);
+    if (!fs.existsSync(outputFileDir)) {
+      fs.mkdirSync(outputFileDir, { recursive: true });
+    }
+
+    // Construir el contenido del archivo
+    let fileContent = '';
+
+    // Ordenar nodos por posición para mantener el orden original
+    const sortedNodes = [...nodes].sort((a, b) => a.getStart() - b.getStart());
+
+    for (const node of sortedNodes) {
+      fileContent += node.getText() + '\n\n';
+    }
+
+    // Escribir el archivo
+    fs.writeFileSync(outputFilePath, fileContent, 'utf-8');
+
+    const relativeOutput = path.relative(process.cwd(), outputFilePath);
+    console.log(`  ✅ ${relativeOutput} (${nodes.length} símbolos)`);
   }
 
-  const [projectRoot, entryFile, symbolName] = args;
+  console.log(`\n✨ Completado. ${result.size} archivos escritos.\n`);
+}
+
+/**
+ * Imprime el resultado del slicing a stdout.
+ */
+function printToStdout(result: Map<string, ts.Declaration[]>, symbolName: string) {
+  console.log(`--- Slicing completo para el símbolo: ${symbolName} ---\n`);
+
+  for (const [fileName, nodes] of result.entries()) {
+    const relativePath = path.relative(process.cwd(), fileName);
+    console.log(`//==================================================`);
+    console.log(`// Archivo: ${relativePath}`);
+    console.log(`//==================================================\n`);
+
+    for (const node of nodes) {
+      console.log(node.getText());
+      console.log("\n//--------------------------------------------------\n");
+    }
+  }
+}
+
+function main() {
+  const program = new Command();
+
+  program
+    .name('slicer')
+    .description('Herramienta CLI para extraer un símbolo y todas sus dependencias de un proyecto TypeScript')
+    .version('1.0.0')
+    .requiredOption('-p, --path <projectPath>', 'Ruta al directorio que contiene el tsconfig.json del proyecto')
+    .requiredOption('-f, --file <entryFile>', 'Ruta al archivo que contiene el símbolo de inicio')
+    .requiredOption('-s, --symbol <symbolName>', 'Nombre del símbolo (función, clase, etc.) a extraer')
+    .option('-o, --output <outputDir>', 'Carpeta donde copiar el código resultante (respeta estructura de directorios)')
+    .addHelpText('after', `
+Ejemplos:
+  # Imprimir a stdout
+  $ ts-node src/slicer.ts -p ./test-project -f ./test-project/src/main.ts -s mainFunction
+
+  # Copiar a directorio de salida
+  $ ts-node src/slicer.ts -p ./test-project -f ./test-project/src/main.ts -s mainFunction -o ./output
+
+  # Con proyecto real (tirio-front)
+  $ ts-node src/slicer.ts -p ../../tirio-front -f ../../tirio-front/src/feats/stateSystem/Events.ts -s createMemorySignals -o ./extracted
+    `);
+
+  program.parse();
+
+  const options = program.opts();
+  const { path: projectRoot, file: entryFile, symbol: symbolName, output: outputDir } = options;
 
   try {
     const slicer = new Slicer(projectRoot);
     const result = slicer.slice(entryFile, symbolName);
 
-    console.log(`--- Slicing completo para el símbolo: ${symbolName} ---\n`);
-
-    for (const [fileName, nodes] of result.entries()) {
-      const relativePath = path.relative(process.cwd(), fileName);
-      console.log(`//==================================================`);
-      console.log(`// Archivo: ${relativePath}`);
-      console.log(`//==================================================\n`);
-      
-      for (const node of nodes) {
-        console.log(node.getText());
-        console.log("\n//--------------------------------------------------\n");
-      }
+    if (outputDir) {
+      // Modo: escribir a directorio de salida
+      writeToOutputDirectory(result, outputDir, projectRoot);
+    } else {
+      // Modo: imprimir a stdout
+      printToStdout(result, symbolName);
     }
   } catch (error) {
     console.error("Error durante el slicing:", error);

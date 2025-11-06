@@ -4,15 +4,19 @@
   "description": "Una herramienta CLI para extraer un símbolo y todas sus dependencias de un proyecto TS.",
   "main": "src/slicer.ts",
   "scripts": {
-    "start": "ts-node src/slicer.ts ./test-project ./test-project/src/main.ts mainFunction",
-    "help": "ts-node slicer.ts",
+    "start": "ts-node src/slicer.ts -p ./test-project -f ./test-project/src/main.ts -s mainFunction",
+    "start:output": "ts-node src/slicer.ts -p ./test-project -f ./test-project/src/main.ts -s mainFunction -o ./output",
+    "help": "ts-node src/slicer.ts --help",
     "tsc": "tsc"
   },
   "author": "",
   "license": "ISC",
-  "devDependencies": {
-    "@types/node": "^24.10.0",
+  "dependencies": {
     "ts-node": "^10.9.2",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "commander": "^14.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0"
   }
 }

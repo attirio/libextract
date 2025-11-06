@@ -3,3 +3,6 @@ yarn*
 *.txt
 *.md
 !README.md
+tmp/
+output
+*extracted

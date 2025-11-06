@@ -1,4 +1,5 @@
 // test-project/src/main.ts
+import { DecoupledPromise } from './DecoupledPromise.js';
 import { User, UserRole } from './types';
 import { getUserApi } from './utils';
 
@@ -9,11 +10,13 @@ function localHelper(value: string) {
 }
 
 // El símbolo que vamos a rastrear
-export function mainFunction(user: User): { url: string; role: UserRole } {
+export async function mainFunction(user: User): Promise< { url: string; role: UserRole } > {
     const url = getUserApi(user.id);
+    const { fine, promise } = new DecoupledPromise< { url: string; role: UserRole } >()
     localHelper(url); // Uso de una función local
     const role: UserRole = 'admin';
-    return { url, role };
+    fine( { url, role } );
+    return promise
 }
 
 // Otra función no utilizada
