@@ -1,0 +1,18 @@
+{
+  "name": "slicerjs",
+  "version": "1.0.0",
+  "description": "Una herramienta CLI para extraer un símbolo y todas sus dependencias de un proyecto TS.",
+  "main": "src/slicer.ts",
+  "scripts": {
+    "start": "ts-node src/slicer.ts ./test-project ./test-project/src/main.ts mainFunction",
+    "help": "ts-node slicer.ts",
+    "tsc": "tsc"
+  },
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
