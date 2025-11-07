@@ -2,6 +2,9 @@ import ts, { isDeclarationStatement } from 'typescript';
 import path from 'path';
 import fs from 'fs';
 import { Command } from 'commander';
+import { ImportGenerator, ExternalDependency } from './utils/importGenerator';
+import { ProjectDetector, ProjectContext } from './utils/projectDetector';
+import { ManifestGenerator } from './utils/manifestGenerator';
 
 /**
  * El "cerebro" de la herramienta.
@@ -12,8 +15,18 @@ class Slicer {
   private checker: ts.TypeChecker;
   private requiredDeclarations = new Set<ts.Declaration>();
   private visitedSymbols = new Set<ts.Symbol>();
+  private projectContext: ProjectContext;
+  private manifestGenerator: ManifestGenerator;
 
   constructor(projectRoot: string) {
+    // Detectar ambiente del proyecto
+    const detector = new ProjectDetector(projectRoot);
+    this.projectContext = detector.detect();
+
+    console.log(`📋 Ambiente: ${this.projectContext.environment} | Package manager: ${this.projectContext.packageManager}`);
+    if (this.projectContext.dependencies.size > 0) {
+      console.log(`📦 Dependencias originales: ${this.projectContext.dependencies.size}`);
+    }
     const configPath = ts.findConfigFile(
       projectRoot,
       ts.sys.fileExists,
@@ -93,6 +106,30 @@ class Slicer {
 
     this.program = ts.createProgram(allFiles, mergedOptions);
     this.checker = this.program.getTypeChecker();
+
+    // Inicializar ManifestGenerator
+    this.manifestGenerator = new ManifestGenerator(this.projectContext);
+  }
+
+  /**
+   * Obtiene el program de TypeScript (útil para análisis externos)
+   */
+  public getProgram(): ts.Program {
+    return this.program;
+  }
+
+  /**
+   * Obtiene el contexto del proyecto
+   */
+  public getProjectContext(): ProjectContext {
+    return this.projectContext;
+  }
+
+  /**
+   * Obtiene el generador de manifiestos
+   */
+  public getManifestGenerator(): ManifestGenerator {
+    return this.manifestGenerator;
   }
 
   /**
@@ -323,22 +360,57 @@ class Slicer {
 
   /**
    * Punto de entrada público para ejecutar el slicer.
+   * Acepta múltiples archivos y símbolos.
    */
-  public slice(entryFilePath: string, symbolName: string): Map<string, ts.Declaration[]> {
-    const entryFileAbs = path.resolve(entryFilePath);
-    const sourceFile = this.program.getSourceFile(entryFileAbs);
-
-    if (!sourceFile) {
-      throw new Error(`Archivo no encontrado en el programa: ${entryFilePath}`);
+  public slice(entryFiles: string[], symbolNames: string[]): Map<string, ts.Declaration[]> {
+    // Validar que tengamos archivos y símbolos
+    if (entryFiles.length === 0) {
+      throw new Error('Debe proporcionar al menos un archivo de entrada');
+    }
+    if (symbolNames.length === 0) {
+      throw new Error('Debe proporcionar al menos un símbolo');
     }
 
-    const rootDeclaration = this.findRootDeclaration(sourceFile, symbolName);
-    if (!rootDeclaration) {
-      throw new Error(`Símbolo '${symbolName}' no encontrado en ${entryFilePath}`);
+    // Si solo hay un archivo, usarlo para todos los símbolos
+    // Si hay múltiples archivos, debe haber el mismo número de símbolos o uno solo
+    let filesToProcess: Array<{ file: string; symbol: string }> = [];
+
+    if (entryFiles.length === 1) {
+      // Un archivo, múltiples símbolos
+      for (const symbolName of symbolNames) {
+        filesToProcess.push({ file: entryFiles[0], symbol: symbolName });
+      }
+    } else if (symbolNames.length === 1) {
+      // Múltiples archivos, un símbolo
+      for (const file of entryFiles) {
+        filesToProcess.push({ file, symbol: symbolNames[0] });
+      }
+    } else if (entryFiles.length === symbolNames.length) {
+      // Mismo número de archivos y símbolos (pares)
+      for (let i = 0; i < entryFiles.length; i++) {
+        filesToProcess.push({ file: entryFiles[i], symbol: symbolNames[i] });
+      }
+    } else {
+      throw new Error(`Número inconsistente de archivos (${entryFiles.length}) y símbolos (${symbolNames.length}). Debe ser 1:N, N:1 o N:N`);
     }
 
-    // Iniciar el proceso recursivo
-    this.collectDependencies(rootDeclaration);
+    // Procesar cada par archivo-símbolo
+    for (const { file, symbol } of filesToProcess) {
+      const entryFileAbs = path.resolve(file);
+      const sourceFile = this.program.getSourceFile(entryFileAbs);
+
+      if (!sourceFile) {
+        throw new Error(`Archivo no encontrado en el programa: ${file}`);
+      }
+
+      const rootDeclaration = this.findRootDeclaration(sourceFile, symbol);
+      if (!rootDeclaration) {
+        throw new Error(`Símbolo '${symbol}' no encontrado en ${file}`);
+      }
+
+      // Iniciar el proceso recursivo para este símbolo
+      this.collectDependencies(rootDeclaration);
+    }
 
     // Agrupar los resultados por archivo
     const nodesByFile = new Map<string, ts.Declaration[]>();
@@ -359,13 +431,109 @@ class Slicer {
   }
 }
 
+// --- Funciones auxiliares ---
+
+/**
+ * Extrae todos los símbolos exportados de un archivo.
+ */
+function extractExportedSymbols(sourceFile: ts.SourceFile): string[] {
+  const exportedSymbols: string[] = [];
+
+  ts.forEachChild(sourceFile, (node) => {
+    // Export named declarations (export function, export class, etc.)
+    if (ts.isExportAssignment(node)) {
+      // export default ...
+      exportedSymbols.push('default');
+    } else if (ts.canHaveModifiers(node)) {
+      const modifiers = ts.getModifiers(node);
+      if (modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword)) {
+        // Es una declaración exportada
+        let name: string | undefined;
+
+        if (ts.isFunctionDeclaration(node) && node.name) {
+          name = node.name.text;
+        } else if (ts.isClassDeclaration(node) && node.name) {
+          name = node.name.text;
+        } else if (ts.isVariableStatement(node)) {
+          // export const foo = ...
+          node.declarationList.declarations.forEach(decl => {
+            if (ts.isIdentifier(decl.name)) {
+              exportedSymbols.push(decl.name.text);
+            }
+          });
+        } else if (ts.isInterfaceDeclaration(node)) {
+          name = node.name.text;
+        } else if (ts.isTypeAliasDeclaration(node)) {
+          name = node.name.text;
+        } else if (ts.isEnumDeclaration(node)) {
+          name = node.name.text;
+        }
+
+        if (name) {
+          exportedSymbols.push(name);
+        }
+      }
+    } else if (ts.isExportDeclaration(node)) {
+      // export { foo, bar }
+      if (node.exportClause && ts.isNamedExports(node.exportClause)) {
+        node.exportClause.elements.forEach(element => {
+          exportedSymbols.push(element.name.text);
+        });
+      }
+    }
+  });
+
+  return exportedSymbols;
+}
+
 // --- Ejecución del CLI ---
+
+/**
+ * Extrae los imports necesarios de un archivo basándose en el análisis de símbolos realmente usados.
+ */
+function extractImports(
+  program: ts.Program,
+  projectContext: ProjectContext,
+  sourceFile: ts.SourceFile,
+  extractedNodes: ts.Declaration[],
+  allExtractedFiles: Set<string>,
+  projectRoot: string,
+  outputDir: string
+): {
+  imports: string[];
+  missingIdentifiers: Set<string>;
+  externalDeps: Map<string, ExternalDependency>;
+} {
+  const generator = new ImportGenerator();
+
+  // Configurar el contexto y el program
+  generator.setProjectContext(projectContext);
+  generator.setProgram(program);
+
+  // Generar imports necesarios basados en uso real
+  const { imports, externalDeps } = generator.generateImports(
+    sourceFile,
+    extractedNodes,
+    allExtractedFiles,
+    projectRoot,
+    outputDir
+  );
+
+  // Detectar identificadores usados sin import (funciones del mismo archivo)
+  const missingIdentifiers = generator.findMissingImports(sourceFile, extractedNodes);
+
+  return { imports, missingIdentifiers, externalDeps };
+}
+
 
 /**
  * Escribe el resultado del slicing a archivos en el directorio de salida,
  * respetando la estructura de directorios del proyecto original.
  */
 function writeToOutputDirectory(
+  program: ts.Program,
+  projectContext: ProjectContext,
+  manifestGenerator: ManifestGenerator,
   result: Map<string, ts.Declaration[]>,
   outputDir: string,
   projectRoot: string
@@ -374,6 +542,16 @@ function writeToOutputDirectory(
   const absoluteOutputDir = path.resolve(outputDir);
 
   console.log(`\n📁 Escribiendo archivos a: ${outputDir}\n`);
+
+  // Obtener set de todos los archivos extraídos (normalizados a rutas absolutas)
+  const allExtractedFiles = new Set<string>();
+  for (const fileName of result.keys()) {
+    const absolutePath = path.isAbsolute(fileName) ? fileName : path.resolve(fileName);
+    allExtractedFiles.add(absolutePath);
+  }
+
+  // Acumular todas las dependencias externas
+  const allExternalDeps = new Map<string, ExternalDependency>();
 
   for (const [fileName, nodes] of result.entries()) {
     // Calcular la ruta relativa desde el proyecto raíz
@@ -388,12 +566,49 @@ function writeToOutputDirectory(
       fs.mkdirSync(outputFileDir, { recursive: true });
     }
 
-    // Construir el contenido del archivo
-    let fileContent = '';
-
     // Ordenar nodos por posición para mantener el orden original
     const sortedNodes = [...nodes].sort((a, b) => a.getStart() - b.getStart());
 
+    // Obtener el sourceFile para extraer imports
+    const sourceFile = sortedNodes[0].getSourceFile();
+
+    // Extraer imports necesarios basados en análisis real de uso
+    const { imports, missingIdentifiers, externalDeps } = extractImports(
+      program,
+      projectContext,
+      sourceFile,
+      sortedNodes,
+      allExtractedFiles,
+      projectRoot,
+      outputDir
+    );
+
+    // Acumular dependencias externas
+    for (const [pkg, dep] of externalDeps.entries()) {
+      if (!allExternalDeps.has(pkg)) {
+        allExternalDeps.set(pkg, dep);
+      } else {
+        // Merge símbolos
+        const existing = allExternalDeps.get(pkg)!;
+        dep.importedSymbols.forEach(s => existing.importedSymbols.add(s));
+        dep.importKinds.forEach(k => existing.importKinds.add(k));
+      }
+    }
+
+    // Reportar identificadores sin import (probablemente funciones del mismo archivo)
+    if (missingIdentifiers.size > 0) {
+      console.log(`  ⚠️  Identificadores usados sin import en ${path.basename(fileName)}: ${Array.from(missingIdentifiers).join(', ')}`);
+    }
+
+    // Construir el contenido del archivo
+    let fileContent = '';
+
+    // Agregar imports primero
+    if (imports.length > 0) {
+      fileContent += imports.join('\n') + '\n\n';
+    }
+
+    // Agregar declaraciones
     for (const node of sortedNodes) {
       fileContent += node.getText() + '\n\n';
     }
@@ -402,10 +617,14 @@ function writeToOutputDirectory(
     fs.writeFileSync(outputFilePath, fileContent, 'utf-8');
 
     const relativeOutput = path.relative(process.cwd(), outputFilePath);
-    console.log(`  ✅ ${relativeOutput} (${nodes.length} símbolos)`);
+    console.log(`  ✅ ${relativeOutput} (${nodes.length} símbolos${imports.length > 0 ? `, ${imports.length} imports` : ''})`);
   }
 
-  console.log(`\n✨ Completado. ${result.size} archivos escritos.\n`);
+  console.log(`\n✨ Completado. ${result.size} archivos escritos.`);
+
+  // Generar manifiestos
+  manifestGenerator.generateManifest(allExternalDeps, absoluteOutputDir);
+  manifestGenerator.generateDependencyReport(allExternalDeps, absoluteOutputDir);
 }
 
 /**
@@ -432,39 +651,168 @@ function main() {
 
   program
     .name('slicer')
-    .description('Herramienta CLI para extraer un símbolo y todas sus dependencias de un proyecto TypeScript')
+    .description('Herramienta CLI para extraer símbolos y todas sus dependencias de un proyecto TypeScript')
     .version('1.0.0')
     .requiredOption('-p, --path <projectPath>', 'Ruta al directorio que contiene el tsconfig.json del proyecto')
-    .requiredOption('-f, --file <entryFile>', 'Ruta al archivo que contiene el símbolo de inicio')
-    .requiredOption('-s, --symbol <symbolName>', 'Nombre del símbolo (función, clase, etc.) a extraer')
     .option('-o, --output <outputDir>', 'Carpeta donde copiar el código resultante (respeta estructura de directorios)')
     .addHelpText('after', `
+Uso especial de -f y -s:
+  Cada -f va seguido de -s con los símbolos que pertenecen a ese archivo.
+  Los símbolos después de -s son todos los que siguen hasta el próximo flag.
+
 Ejemplos:
-  # Imprimir a stdout
+  # Un archivo, un símbolo
   $ ts-node src/slicer.ts -p ./test-project -f ./test-project/src/main.ts -s mainFunction
 
-  # Copiar a directorio de salida
-  $ ts-node src/slicer.ts -p ./test-project -f ./test-project/src/main.ts -s mainFunction -o ./output
+  # Un archivo, múltiples símbolos
+  $ ts-node src/slicer.ts -p ./test-project -f ./test-project/src/main.ts -s mainFunction classX classY
 
-  # Con proyecto real (tirio-front)
-  $ ts-node src/slicer.ts -p ../../tirio-front -f ../../tirio-front/src/feats/stateSystem/Events.ts -s createMemorySignals -o ./extracted
-    `);
+  # Múltiples archivos con sus símbolos
+  $ ts-node src/slicer.ts -p ./project -f ./src/file1.ts -s symbol1 symbol2 -f ./src/file2.ts -s symbol3
+
+  # Usando wildcards en símbolos
+  $ ts-node src/slicer.ts -p ./project -f ./src/main.ts -s feature* create*
+
+  # Extraer TODOS los símbolos exportados de un archivo
+  $ ts-node src/slicer.ts -p ./project -f ./src/main.ts -s *
+
+  # Con directorio de salida
+  $ ts-node src/slicer.ts -p ./test-project -f ./test-project/src/main.ts -s mainFunction -o ./output
+    `)
+    .allowUnknownOption()
+    .allowExcessArguments();
 
   program.parse();
 
   const options = program.opts();
-  const { path: projectRoot, file: entryFile, symbol: symbolName, output: outputDir } = options;
+  const { path: projectRoot, output: outputDir } = options;
+
+  // Parser personalizado para -f y -s
+  const args = process.argv.slice(2);
+  const fileSymbolPairs: Array<{ file: string; symbols: string[] }> = [];
+
+  let currentFile: string | null = null;
+  let i = 0;
+
+  while (i < args.length) {
+    if (args[i] === '-f' || args[i] === '--file') {
+      // Guardar el archivo anterior si existe sin símbolos
+      if (currentFile) {
+        throw new Error(`El archivo ${currentFile} no tiene símbolos asociados (-s)`);
+      }
+
+      i++;
+      if (i >= args.length || args[i].startsWith('-')) {
+        throw new Error('Se esperaba un archivo después de -f');
+      }
+      currentFile = args[i];
+      i++;
+    } else if (args[i] === '-s' || args[i] === '--symbol') {
+      if (!currentFile) {
+        throw new Error('Debe especificar -f antes de -s');
+      }
+
+      // Recoger todos los símbolos hasta el siguiente flag
+      i++;
+      const symbols: string[] = [];
+      while (i < args.length && !args[i].startsWith('-')) {
+        symbols.push(args[i]);
+        i++;
+      }
+
+      if (symbols.length === 0) {
+        throw new Error('Se esperaba al menos un símbolo después de -s');
+      }
+
+      fileSymbolPairs.push({ file: currentFile, symbols });
+      currentFile = null;
+    } else {
+      i++;
+    }
+  }
+
+  // Si quedó un archivo sin símbolos al final
+  if (currentFile) {
+    throw new Error(`El archivo ${currentFile} no tiene símbolos asociados (-s)`);
+  }
+
+  if (fileSymbolPairs.length === 0) {
+    console.error('Error: Debe especificar al menos un par -f <archivo> -s <símbolos>');
+    program.help();
+  }
+
+  // Validar que tenemos projectRoot
+  if (!projectRoot) {
+    console.error('Error: Debe especificar -p <projectPath>');
+    program.help();
+  }
 
   try {
     const slicer = new Slicer(projectRoot);
-    const result = slicer.slice(entryFile, symbolName);
+
+    // Expandir wildcards en símbolos
+    const expandedPairs: Array<{ file: string; symbol: string }> = [];
+
+    for (const pair of fileSymbolPairs) {
+      const { file, symbols } = pair;
+      const absoluteFilePath = path.resolve(file);
+
+      // Obtener el source file para encontrar símbolos
+      const sourceFile = slicer.getProgram().getSourceFile(absoluteFilePath);
+      if (!sourceFile) {
+        throw new Error(`No se pudo encontrar el archivo: ${file}`);
+      }
+
+      for (const symbolPattern of symbols) {
+        if (symbolPattern === '*') {
+          // Extraer TODOS los símbolos exportados
+          const exportedSymbols = extractExportedSymbols(sourceFile);
+          for (const exportedSymbol of exportedSymbols) {
+            expandedPairs.push({ file, symbol: exportedSymbol });
+          }
+        } else if (symbolPattern.includes('*')) {
+          // Wildcard pattern (ej: feature*, *Manager)
+          const exportedSymbols = extractExportedSymbols(sourceFile);
+          const regex = new RegExp('^' + symbolPattern.replace(/\*/g, '.*') + '$');
+          const matchedSymbols = exportedSymbols.filter(sym => regex.test(sym));
+
+          if (matchedSymbols.length === 0) {
+            console.warn(`⚠️  No se encontraron símbolos que coincidan con el patrón "${symbolPattern}" en ${path.basename(file)}`);
+          }
+
+          for (const matchedSymbol of matchedSymbols) {
+            expandedPairs.push({ file, symbol: matchedSymbol });
+          }
+        } else {
+          // Símbolo exacto
+          expandedPairs.push({ file, symbol: symbolPattern });
+        }
+      }
+    }
+
+    if (expandedPairs.length === 0) {
+      throw new Error('No se encontraron símbolos para extraer');
+    }
+
+    // Convertir a formato que espera slice()
+    const filesArray = expandedPairs.map(p => p.file);
+    const symbolsArray = expandedPairs.map(p => p.symbol);
+
+    const result = slicer.slice(filesArray, symbolsArray);
 
     if (outputDir) {
       // Modo: escribir a directorio de salida
-      writeToOutputDirectory(result, outputDir, projectRoot);
+      writeToOutputDirectory(
+        slicer.getProgram(),
+        slicer.getProjectContext(),
+        slicer.getManifestGenerator(),
+        result,
+        outputDir,
+        projectRoot
+      );
     } else {
       // Modo: imprimir a stdout
-      printToStdout(result, symbolName);
+      printToStdout(result, symbolsArray.join(', '));
     }
   } catch (error) {
     console.error("Error durante el slicing:", error);

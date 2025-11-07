@@ -1,5 +1,5 @@
 // test-project/src/main.ts
-import { DecoupledPromise } from './DecoupledPromise.js';
+import { DecoupledPromise } from './DecoupledPromise';
 import { User, UserRole } from './types';
 import { getUserApi } from './utils';
 
