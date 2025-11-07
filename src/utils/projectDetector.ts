@@ -227,6 +227,7 @@ export class ProjectDetector {
 
   /**
    * Parsea tsconfig.json para obtener compilerOptions y path aliases
+   * Incluye paths de TypeScript Project References
    */
   private parseTsConfig(tsconfigPath: string | null): {
     compilerOptions: ts.CompilerOptions;
@@ -251,18 +252,36 @@ export class ProjectDetector {
 
       compilerOptions = parsedConfig.options;
 
-      // Extraer path aliases
-      const paths = compilerOptions.paths;
-      const baseUrl = compilerOptions.baseUrl;
+      // Extraer path aliases del tsconfig principal
+      this.extractPathAliases(compilerOptions, configDir, pathAliases);
 
-      if (paths && baseUrl) {
-        for (const [alias, mappings] of Object.entries(paths)) {
-          // "@/*" -> "@"
-          const cleanAlias = alias.replace(/\/\*$/, '');
-          // "src/*" -> "src"
-          const cleanMapping = mappings[0].replace(/\/\*$/, '');
-          const absolutePath = path.resolve(configDir, baseUrl, cleanMapping);
-          pathAliases.set(cleanAlias, absolutePath);
+      // Si tiene referencias (TypeScript Project References), cargar paths de ellas
+      if (configFile.config.references && Array.isArray(configFile.config.references)) {
+        for (const reference of configFile.config.references) {
+          const refPath = path.resolve(configDir, reference.path);
+
+          // Buscar el archivo tsconfig en la referencia
+          let refConfigPath = refPath;
+          if (!refConfigPath.endsWith('.json')) {
+            refConfigPath = path.join(refPath, 'tsconfig.json');
+          }
+
+          if (fs.existsSync(refConfigPath)) {
+            const refConfigFile = ts.readConfigFile(refConfigPath, ts.sys.readFile);
+            const refConfigDir = path.dirname(refConfigPath);
+
+            const refParsedConfig = ts.parseJsonConfigFileContent(
+              refConfigFile.config,
+              ts.sys,
+              refConfigDir
+            );
+
+            // Extraer paths de la referencia
+            this.extractPathAliases(refParsedConfig.options, refConfigDir, pathAliases);
+
+            // Merge compiler options (la referencia puede tener opciones adicionales)
+            compilerOptions = { ...compilerOptions, ...refParsedConfig.options };
+          }
         }
       }
     } catch (error) {
@@ -270,5 +289,32 @@ export class ProjectDetector {
     }
 
     return { compilerOptions, pathAliases };
+  }
+
+  /**
+   * Extrae path aliases de compilerOptions
+   */
+  private extractPathAliases(
+    options: ts.CompilerOptions,
+    configDir: string,
+    pathAliases: Map<string, string>
+  ): void {
+    const paths = options.paths;
+    const baseUrl = options.baseUrl;
+
+    if (paths && baseUrl) {
+      for (const [alias, mappings] of Object.entries(paths)) {
+        // "@/*" -> "@"
+        const cleanAlias = alias.replace(/\/\*$/, '');
+        // "src/*" -> "src"
+        const cleanMapping = mappings[0].replace(/\/\*$/, '');
+        const absolutePath = path.resolve(configDir, baseUrl, cleanMapping);
+
+        // No sobrescribir si ya existe (prioridad al tsconfig principal)
+        if (!pathAliases.has(cleanAlias)) {
+          pathAliases.set(cleanAlias, absolutePath);
+        }
+      }
+    }
   }
 }

@@ -74,6 +74,7 @@ export class ImportGenerator {
 
     // 4. Mapear cada identificador a su import
     const importsNeeded = new Map<string, Set<string>>(); // key -> Set<symbolName>
+    const realModulePaths = new Map<string, string>(); // key -> realModulePath (para re-exports)
 
     for (const identifier of externalIdentifiers) {
       const importInfo = this.importResolver.findImportInfo(identifier);
@@ -87,12 +88,30 @@ export class ImportGenerator {
       const key = importInfo.modulePath || importInfo.moduleSpecifier;
 
       if (importInfo.type === 'internal') {
-        // INTERNO: Solo incluir si el archivo está en los extraídos
-        if (importInfo.modulePath && allExtractedFiles.has(importInfo.modulePath)) {
+        // INTERNO: Resolver re-exports y verificar si está en los extraídos
+        let finalModulePath = importInfo.modulePath;
+
+        if (finalModulePath && this.reexportResolver) {
+          // Intentar resolver re-export para encontrar el archivo REAL del símbolo
+          const realSourcePath = this.reexportResolver.resolveSymbolSource(
+            finalModulePath,
+            identifier
+          );
+          if (realSourcePath) {
+            finalModulePath = realSourcePath;
+          }
+        }
+
+        // Verificar si el archivo REAL está en los extraídos
+        if (finalModulePath && allExtractedFiles.has(finalModulePath)) {
+          // Usar la key ORIGINAL (modulePath del import) para mantener la referencia al ImportInfo
           if (!importsNeeded.has(key)) {
             importsNeeded.set(key, new Set());
           }
           importsNeeded.get(key)!.add(identifier);
+
+          // Guardar el archivo REAL para generar el import correcto
+          realModulePaths.set(key, finalModulePath);
         }
       } else if (importInfo.type === 'external' || importInfo.type === 'builtin') {
         // EXTERNO/BUILTIN: Siempre incluir
@@ -113,24 +132,35 @@ export class ImportGenerator {
     const absoluteProjectRoot = path.resolve(projectRoot);
 
     for (const [key, symbols] of importsNeeded.entries()) {
-      const importInfo = this.importResolver.getImportBySpecifier(key) ||
-                         originalImports.get(key);
+      // key puede ser modulePath (para internos) o moduleSpecifier (para externos)
+      const importInfo = this.importResolver.getImportByKey(key);
 
-      if (!importInfo) continue;
+      if (!importInfo) {
+        console.warn(`  ⚠️  No se encontró ImportInfo para key: ${key}`);
+        continue;
+      }
 
       if (importInfo.type === 'internal') {
         // Generar import relativo
-        imports.push(this.generateInternalImport(
+        const realModulePath = realModulePaths.get(key);
+        const generatedImport = this.generateInternalImport(
           importInfo,
           symbols,
           sourceFile,
           absoluteProjectRoot,
           outputDir,
-          originalImports
-        ));
+          originalImports,
+          realModulePath
+        );
+        if (generatedImport) {
+          imports.push(generatedImport);
+        }
       } else {
         // Generar import externo (preservar original)
-        imports.push(this.generateExternalImport(importInfo, symbols));
+        const generatedImport = this.generateExternalImport(importInfo, symbols);
+        if (generatedImport) {
+          imports.push(generatedImport);
+        }
       }
     }
 
@@ -146,9 +176,13 @@ export class ImportGenerator {
     sourceFile: ts.SourceFile,
     projectRoot: string,
     outputDir: string,
-    originalImports: Map<string, ImportInfo>
+    originalImports: Map<string, ImportInfo>,
+    realModulePath?: string  // Path real del archivo (para re-exports)
   ): string {
-    if (!importInfo.modulePath) {
+    // Usar realModulePath si está disponible (para re-exports), sino el modulePath original
+    const modulePath = realModulePath || importInfo.modulePath;
+
+    if (!modulePath) {
       throw new Error('Internal import must have modulePath');
     }
 
@@ -161,7 +195,7 @@ export class ImportGenerator {
 
     const targetOutputFile = path.join(
       path.resolve(outputDir),
-      path.relative(projectRoot, importInfo.modulePath)
+      path.relative(projectRoot, modulePath)
     );
 
     let relativeImport = path.relative(currentOutputDir, targetOutputFile);

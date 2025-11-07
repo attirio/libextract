@@ -345,6 +345,13 @@ export class ImportResolver {
   }
 
   /**
+   * Obtiene ImportInfo por key (modulePath o specifier)
+   */
+  public getImportByKey(key: string): ImportInfo | null {
+    return this.importMap.get(key) || null;
+  }
+
+  /**
    * Obtiene todos los símbolos importados de un archivo específico
    */
   public getImportedSymbolsFromFile(modulePath: string): Set<string> {
