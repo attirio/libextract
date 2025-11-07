@@ -40,7 +40,12 @@ export class ReexportResolver {
         if (!declarations || declarations.length === 0) continue;
 
         const declaration = declarations[0];
-        const declarationFile = declaration.getSourceFile().fileName;
+        let declarationFile = declaration.getSourceFile().fileName;
+
+        // Normalizar a ruta absoluta
+        if (!path.isAbsolute(declarationFile)) {
+          declarationFile = path.resolve(declarationFile);
+        }
 
         // Si la declaración está en un archivo diferente, es un re-export
         if (declarationFile !== importedFilePath) {

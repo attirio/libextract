@@ -61,6 +61,31 @@ export class IdentifierAnalyzer {
       }
     }
 
+    // Manejo especial para expresiones 'new' (constructores)
+    // El identificador del constructor es un VALOR, pero los type arguments son TIPOS
+    if (ts.isNewExpression(node)) {
+      // Visitar la expresión del constructor como VALOR
+      if (node.expression) {
+        this.visitNode(node.expression, false); // false = contexto de valor
+      }
+
+      // Visitar los type arguments como TIPOS
+      if (node.typeArguments) {
+        for (const typeArg of node.typeArguments) {
+          this.visitNode(typeArg, true); // true = contexto de tipo
+        }
+      }
+
+      // Visitar los argumentos del constructor como VALORES
+      if (node.arguments) {
+        for (const arg of node.arguments) {
+          this.visitNode(arg, false); // false = contexto de valor
+        }
+      }
+
+      return; // No usar ts.forEachChild, ya visitamos manualmente
+    }
+
     // Visitar hijos, pasando el contexto correcto
     ts.forEachChild(node, (child) => this.visitNode(child, inTypeContext));
   }
