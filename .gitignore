@@ -3,7 +3,9 @@ yarn*
 *.txt
 *.md
 !README.md
+!README_DEV.md
 tmp/
+dist/
 output
 *extracted
 *output
