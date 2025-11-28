@@ -1,6 +1,6 @@
 {
   "name": "@tirio/libextract",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Una herramienta CLI para extraer un símbolo y todas sus dependencias de un proyecto TS.",
   "main": "dist/slicer.js",
   "types": "dist/slicer.d.ts",
@@ -9,13 +9,12 @@
   },
   "files": [
     "dist",
-    "README.md",
-    "README_DEV.md"
+    "README.md"
   ],
   "scripts": {
     "dev": "ts-node src/slicer.ts",
     "help": "ts-node src/slicer.ts --help",
-    "build": "tsc --outDir dist"
+    "build": "tsc --outDir dist; printf '%s\n%s\n' '#!/usr/bin/env node' \"$(cat dist/slicer.js)\" > dist/slicer.js"
   },
   "author": "triton",
   "license": "ISC",
